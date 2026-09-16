@@ -36,6 +36,8 @@ const roomPlayers = new Map();
 const latestScores = new Map();
 const discoveredRooms = new Map();
 
+const pendingHits = new Set();
+
 const $ = (id) => document.getElementById(id);
 
 const screens = {
@@ -428,6 +430,7 @@ function hostStartGame() {
   roomState = 'playing';
   remaining = duration;
   activeMoles.clear();
+  pendingHits.clear();
 
   for (const player of roomPlayers.values()) {
     player.score = 0;
@@ -569,10 +572,14 @@ function onMoleSpawn({ holeIndex, moleId }) {
 }
 
 function onMoleDespawn({ holeIndex, moleId }) {
+  pendingHits.delete(moleId);
+
   if (activeMoles.get(holeIndex) !== moleId) return;
+
   activeMoles.delete(holeIndex);
 
   const hole = getHoleEl(holeIndex);
+
   if (hole) {
     hole.classList.remove('active');
     hole.classList.add('hit');
@@ -581,11 +588,44 @@ function onMoleDespawn({ holeIndex, moleId }) {
 
 function onHoleClick(holeIndex) {
   if (roomState !== 'playing') return;
+
   const moleId = activeMoles.get(holeIndex);
   if (!moleId) return;
 
+  // 同一隻地鼠已經點過就不再處理
+  if (pendingHits.has(moleId)) return;
+
+  pendingHits.add(moleId);
+
   const hole = getHoleEl(holeIndex);
-  if (hole) hole.classList.remove('active');
+
+  if (hole) {
+    hole.classList.remove('active');
+    hole.classList.add('hit');
+  }
+
+  // Optimistic UI：自己的分數立即增加
+  const currentScore = latestScores.get(playerId)?.score ?? 0;
+
+  latestScores.set(playerId, {
+    name: playerName,
+    score: currentScore + 1,
+  });
+
+  $('myScore').textContent = currentScore + 1;
+
+  // 房主自己直接處理，不繞 MQTT
+  if (isHost) {
+    hostHandleHit({
+      playerId,
+      playerName,
+      holeIndex,
+      moleId,
+      ts: Date.now(),
+    });
+
+    return;
+  }
 
   publish(`${TOPIC_ROOT}/game/${roomId}/mole/hit`, {
     playerId,
@@ -598,11 +638,17 @@ function onHoleClick(holeIndex) {
 
 function onScoreUpdate(scores) {
   latestScores.clear();
+
   scores.forEach((s) => {
-    latestScores.set(s.playerId, { name: s.name, score: Number(s.score || 0) });
+    latestScores.set(s.playerId, {
+      name: s.name,
+      score: Number(s.score || 0),
+    });
   });
 
-  $('myScore').textContent = latestScores.get(playerId)?.score ?? 0;
+  $('myScore').textContent =
+    latestScores.get(playerId)?.score ?? 0;
+
   renderScoreboard($('scoreboard'), scores);
 }
 
