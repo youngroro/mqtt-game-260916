@@ -8,12 +8,6 @@
 - `style.css`
 - `game.js`
 
-不需要：
-
-- Docker
-- Node.js backend
-- npm build
-
 ## 執行方式
 
 直接部署到 GitHub Pages 即可。
