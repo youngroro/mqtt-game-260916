@@ -1,42 +1,36 @@
 'use strict';
 
-// Pure frontend architecture:
-// - No REST API / Node backend.
-// - Every browser connects directly to an MQTT broker over secure WebSocket.
-// - The room host is the authority for room state, mole spawning and scoring.
+// GitHub Pages-friendly MQTT race game.
+// No backend, no Docker, no Node.js server.
+// Every browser connects directly to MQTT over Secure WebSocket.
 
 const MQTT_WS_URL = 'wss://broker.emqx.io:8084/mqtt';
-const TOPIC_ROOT = 'whack-a-mole-gh-pages-v1';
+const TOPIC_ROOT = 'mqtt-browser-race-v1';
 const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const ROOM_STALE_MS = 15000;
 const ROOM_HEARTBEAT_MS = 5000;
-const MIN_SPAWN_DELAY_MS = 450;
-const MAX_SPAWN_DELAY_MS = 1000;
-const MIN_SHOW_TIME_MS = 700;
-const MAX_SHOW_TIME_MS = 1400;
+const JOIN_TIMEOUT_MS = 4000;
+
+const RUNNER_EMOJIS = ['🏃', '🐰', '🐱', '🐶', '🦊', '🐼', '🐸', '🐵'];
 
 let playerId = createId();
-let playerName = null;
+let playerName = '';
 let roomId = null;
-let gridSize = 3;
-let duration = 60;
 let hostId = null;
 let isHost = false;
 let roomState = 'waiting';
-let remaining = 0;
-
+let finishDistance = 30;
 let mqttClient = null;
 let roomHeartbeatTimer = null;
 let roomListTimer = null;
-let countdownTimer = null;
-let spawnTimer = null;
+let joinTimeoutTimer = null;
 
-const activeMoles = new Map();
+// Authoritative room state is kept by the host.
 const roomPlayers = new Map();
-const latestScores = new Map();
-const discoveredRooms = new Map();
 
-const pendingHits = new Set();
+// Local view of positions on every browser.
+const positions = new Map();
+const discoveredRooms = new Map();
 
 const $ = (id) => document.getElementById(id);
 
@@ -48,12 +42,8 @@ const screens = {
 };
 
 function createId() {
-  if (crypto?.randomUUID) return crypto.randomUUID();
+  if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-function randomBetween(min, max) {
-  return Math.floor(min + Math.random() * (max - min));
 }
 
 function generateRoomCode() {
@@ -70,59 +60,78 @@ function showScreen(name) {
   });
 }
 
-function setConnStatus(online) {
+function setConnectionStatus(connected) {
   const el = $('connStatus');
-  el.textContent = online ? 'MQTT: 已連線' : 'MQTT: 連線中...';
-  el.classList.toggle('online', online);
-  el.classList.toggle('offline', !online);
+  el.textContent = connected ? 'MQTT：已連線' : 'MQTT：連線中...';
+  el.classList.toggle('online', connected);
+  el.classList.toggle('offline', !connected);
 }
 
-function showLoginError(msg) {
-  $('loginError').textContent = msg || '';
+function setError(message = '') {
+  $('loginError').textContent = message;
 }
 
 function getNickname() {
   const name = $('nicknameInput').value.trim();
   if (!name) {
-    showLoginError('請先輸入暱稱');
+    setError('請先輸入暱稱');
     return null;
   }
-  showLoginError('');
-  return name;
+  setError('');
+  return name.slice(0, 16);
 }
 
 function publish(topic, payload, options = {}) {
-  if (!mqttClient?.connected) return;
+  if (!mqttClient?.connected) return false;
+
   mqttClient.publish(topic, JSON.stringify(payload), {
     qos: 0,
     retain: Boolean(options.retain),
   });
+
+  return true;
+}
+
+function clearRetained(topic) {
+  if (!mqttClient?.connected) return;
+  mqttClient.publish(topic, '', { qos: 0, retain: true });
 }
 
 function connectMqtt() {
   if (mqttClient) return;
 
   mqttClient = mqtt.connect(MQTT_WS_URL, {
-    clientId: `web-${playerId}-${Math.random().toString(16).slice(2)}`,
-    reconnectPeriod: 2000,
+    clientId: `race-web-${createId()}`,
     clean: true,
+    reconnectPeriod: 2000,
+    connectTimeout: 10000,
   });
 
   mqttClient.on('connect', () => {
-    setConnStatus(true);
+    setConnectionStatus(true);
     mqttClient.subscribe(`${TOPIC_ROOT}/rooms/+/meta`);
-    if (roomId) subscribeRoom(roomId);
+
+    if (roomId) {
+      subscribeRoom(roomId);
+      if (isHost) {
+        publishHostSnapshot();
+        startRoomHeartbeat();
+      }
+    }
+
     renderRoomList();
   });
 
-  mqttClient.on('reconnect', () => setConnStatus(false));
-  mqttClient.on('close', () => setConnStatus(false));
-  mqttClient.on('error', (err) => console.error('MQTT error', err));
+  mqttClient.on('reconnect', () => setConnectionStatus(false));
+  mqttClient.on('close', () => setConnectionStatus(false));
+  mqttClient.on('offline', () => setConnectionStatus(false));
+  mqttClient.on('error', (err) => console.error('MQTT error:', err));
 
-  mqttClient.on('message', (topic, payloadBuf) => {
+  mqttClient.on('message', (topic, payloadBuffer) => {
     let data;
+
     try {
-      data = JSON.parse(payloadBuf.toString());
+      data = JSON.parse(payloadBuffer.toString());
     } catch {
       return;
     }
@@ -133,8 +142,9 @@ function connectMqtt() {
     }
 
     if (!roomId || !topic.startsWith(`${TOPIC_ROOT}/game/${roomId}/`)) return;
-    const sub = topic.slice(`${TOPIC_ROOT}/game/${roomId}/`.length);
-    handleRoomMessage(sub, data);
+
+    const subTopic = topic.slice(`${TOPIC_ROOT}/game/${roomId}/`.length);
+    handleRoomMessage(subTopic, data);
   });
 }
 
@@ -145,9 +155,14 @@ function subscribeRoom(code) {
 function handleRoomMeta(topic, data) {
   const parts = topic.split('/');
   const code = parts[2];
+
   if (!code || !data) return;
 
-  discoveredRooms.set(code, { ...data, roomId: code });
+  discoveredRooms.set(code, {
+    ...data,
+    roomId: code,
+  });
+
   renderRoomList();
 }
 
@@ -157,26 +172,31 @@ function renderRoomList() {
 
   const now = Date.now();
   const rooms = [...discoveredRooms.values()]
-    .filter((room) => room.state === 'waiting' && now - Number(room.updatedAt || 0) <= ROOM_STALE_MS)
+    .filter((room) => room.state === 'waiting')
+    .filter((room) => now - Number(room.updatedAt || 0) <= ROOM_STALE_MS)
     .sort((a, b) => String(a.roomId).localeCompare(String(b.roomId)));
 
   list.innerHTML = '';
+
   if (rooms.length === 0) {
-    list.innerHTML = '<li>目前沒有房間，建立一個吧！</li>';
+    const li = document.createElement('li');
+    li.textContent = '目前沒有可加入的房間';
+    list.appendChild(li);
     return;
   }
 
   rooms.forEach((room) => {
     const li = document.createElement('li');
-    const span = document.createElement('span');
-    span.textContent = `🏠 ${room.roomId}（${room.hostName || '房主'}）｜${room.gridSize}x${room.gridSize}｜${room.duration}s｜${room.playerCount || 1} 人`;
 
-    const btn = document.createElement('button');
-    btn.textContent = '加入';
-    btn.className = 'secondary';
-    btn.onclick = () => doJoinRoom(room.roomId);
+    const info = document.createElement('span');
+    info.textContent = `🏠 ${room.roomId}｜${room.hostName || '房主'}｜${room.finishDistance || 30} 格｜${room.playerCount || 1} 人`;
 
-    li.append(span, btn);
+    const button = document.createElement('button');
+    button.className = 'secondary small';
+    button.textContent = '加入';
+    button.addEventListener('click', () => doJoinRoom(room.roomId));
+
+    li.append(info, button);
     list.appendChild(li);
   });
 }
@@ -184,24 +204,29 @@ function renderRoomList() {
 function doCreateRoom() {
   const name = getNickname();
   if (!name) return;
+
   if (!mqttClient?.connected) {
-    showLoginError('MQTT 尚未連線，請稍後再試');
+    setError('MQTT 尚未連線');
     return;
   }
 
-  playerName = name;
   playerId = createId();
+  playerName = name;
   roomId = generateRoomCode();
-  gridSize = parseInt($('gridSizeSelect').value, 10) || 3;
-  duration = parseInt($('durationSelect').value, 10) || 60;
-  remaining = duration;
   hostId = playerId;
   isHost = true;
   roomState = 'waiting';
+  finishDistance = Number($('finishDistanceSelect').value) || 30;
 
   roomPlayers.clear();
-  latestScores.clear();
-  roomPlayers.set(playerId, { id: playerId, name: playerName, score: 0 });
+  positions.clear();
+
+  roomPlayers.set(playerId, {
+    id: playerId,
+    name: playerName,
+    position: 0,
+  });
+  positions.set(playerId, 0);
 
   subscribeRoom(roomId);
   enterLobby();
@@ -209,31 +234,40 @@ function doCreateRoom() {
   startRoomHeartbeat();
 }
 
-function doJoinRoom(explicitRoomId) {
+function doJoinRoom(explicitCode) {
   const name = getNickname();
   if (!name) return;
+
   if (!mqttClient?.connected) {
-    showLoginError('MQTT 尚未連線，請稍後再試');
+    setError('MQTT 尚未連線');
     return;
   }
 
-  const code = String(explicitRoomId || $('roomCodeInput').value).trim().toUpperCase();
+  const code = String(explicitCode || $('roomCodeInput').value)
+    .trim()
+    .toUpperCase();
+
   if (!code) {
-    showLoginError('請輸入房間代碼');
+    setError('請輸入房間代碼');
     return;
   }
 
   const knownRoom = discoveredRooms.get(code);
   if (knownRoom && Date.now() - Number(knownRoom.updatedAt || 0) > ROOM_STALE_MS) {
-    showLoginError('房間已離線或不存在');
+    setError('房間可能已離線');
     return;
   }
 
-  playerName = name;
   playerId = createId();
+  playerName = name;
   roomId = code;
+  hostId = knownRoom?.hostId || null;
   isHost = false;
   roomState = 'waiting';
+  finishDistance = Number(knownRoom?.finishDistance || 30);
+
+  roomPlayers.clear();
+  positions.clear();
 
   subscribeRoom(roomId);
   enterLobby();
@@ -244,63 +278,78 @@ function doJoinRoom(explicitRoomId) {
       playerName,
       ts: Date.now(),
     });
-  }, 150);
+  }, 120);
 
-  setTimeout(() => {
+  clearTimeout(joinTimeoutTimer);
+  joinTimeoutTimer = setTimeout(() => {
     if (!roomPlayers.has(playerId) && roomState === 'waiting') {
-      showLoginError('無法加入房間，房主可能已離線');
-      showScreen('login');
+      setError('無法加入房間，房主可能已離線');
       roomId = null;
+      showScreen('login');
     }
-  }, 3000);
+  }, JOIN_TIMEOUT_MS);
 }
 
 function enterLobby() {
   showScreen('lobby');
-  $('lobbyRoomId').textContent = roomId;
-  $('lobbyGridSize').textContent = `${gridSize} x ${gridSize}`;
-  $('lobbyDuration').textContent = duration;
+  $('lobbyRoomId').textContent = roomId || '-----';
+  $('lobbyFinishDistance').textContent = finishDistance;
   $('startGameBtn').hidden = !isHost;
   $('lobbyWaitingMsg').hidden = isHost;
+  renderLobbyPlayers();
 }
 
-function handleRoomMessage(sub, data) {
-  switch (sub) {
+function renderLobbyPlayers() {
+  const list = $('lobbyPlayers');
+  list.innerHTML = '';
+
+  const players = [...roomPlayers.values()];
+
+  if (players.length === 0) {
+    const li = document.createElement('li');
+    li.textContent = '等待玩家資料...';
+    list.appendChild(li);
+    return;
+  }
+
+  players.forEach((player) => {
+    const li = document.createElement('li');
+    li.textContent = player.id === hostId ? `👑 ${player.name}` : player.name;
+    list.appendChild(li);
+  });
+}
+
+function handleRoomMessage(subTopic, data) {
+  switch (subTopic) {
     case 'join/request':
       if (isHost) hostHandleJoin(data);
       break;
+
     case 'join/rejected':
       if (data.playerId === playerId) {
-        showLoginError(data.message || '無法加入房間');
+        clearTimeout(joinTimeoutTimer);
+        setError(data.message || '無法加入房間');
         roomId = null;
         showScreen('login');
       }
       break;
+
     case 'state':
       onStateUpdate(data);
       break;
+
     case 'players':
       onPlayersUpdate(data.players || []);
       break;
-    case 'mole/spawn':
-      onMoleSpawn(data);
+
+    case 'race/progress':
+      onRaceProgress(data);
       break;
-    case 'mole/despawn':
-      onMoleDespawn(data);
+
+    case 'race/result':
+      onRaceResult(data);
       break;
-    case 'mole/hit':
-      if (isHost) hostHandleHit(data);
-      break;
-    case 'score/update':
-      onScoreUpdate(data.scores || []);
-      break;
-    case 'countdown':
-      remaining = Number(data.remaining ?? remaining);
-      $('timeRemaining').textContent = remaining;
-      break;
-    case 'result':
-      onResult(data.leaderboard || []);
-      break;
+
     default:
       break;
   }
@@ -312,7 +361,7 @@ function hostHandleJoin({ playerId: joiningId, playerName: joiningName } = {}) {
   if (roomState !== 'waiting') {
     publish(`${TOPIC_ROOT}/game/${roomId}/join/rejected`, {
       playerId: joiningId,
-      message: '遊戲已開始，無法加入',
+      message: '比賽已開始，無法加入',
     });
     return;
   }
@@ -321,8 +370,9 @@ function hostHandleJoin({ playerId: joiningId, playerName: joiningName } = {}) {
     roomPlayers.set(joiningId, {
       id: joiningId,
       name: String(joiningName).trim().slice(0, 16) || '玩家',
-      score: 0,
+      position: 0,
     });
+    positions.set(joiningId, 0);
   }
 
   publishPlayers();
@@ -331,50 +381,55 @@ function hostHandleJoin({ playerId: joiningId, playerName: joiningName } = {}) {
 }
 
 function publishHostSnapshot() {
+  if (!isHost) return;
   publishState();
   publishPlayers();
   publishRoomMeta();
 }
 
 function publishState() {
-  if (!isHost) return;
-  publish(`${TOPIC_ROOT}/game/${roomId}/state`, {
-    state: roomState,
-    roomId,
-    gridSize,
-    duration,
-    remaining,
-    hostId,
-  }, { retain: true });
+  if (!isHost || !roomId) return;
+
+  publish(
+    `${TOPIC_ROOT}/game/${roomId}/state`,
+    {
+      roomId,
+      state: roomState,
+      hostId,
+      finishDistance,
+      updatedAt: Date.now(),
+    },
+    { retain: true },
+  );
 }
 
 function publishPlayers() {
-  if (!isHost) return;
-  publish(`${TOPIC_ROOT}/game/${roomId}/players`, {
-    players: [...roomPlayers.values()],
-  }, { retain: true });
-}
+  if (!isHost || !roomId) return;
 
-function publishScores() {
-  if (!isHost) return;
-  const scores = [...roomPlayers.values()]
-    .map((p) => ({ playerId: p.id, name: p.name, score: p.score }))
-    .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
-
-  publish(`${TOPIC_ROOT}/game/${roomId}/score/update`, { scores });
+  publish(
+    `${TOPIC_ROOT}/game/${roomId}/players`,
+    {
+      players: [...roomPlayers.values()],
+    },
+    { retain: true },
+  );
 }
 
 function publishRoomMeta() {
   if (!isHost || !roomId) return;
-  publish(`${TOPIC_ROOT}/rooms/${roomId}/meta`, {
-    hostId,
-    hostName: roomPlayers.get(hostId)?.name || playerName,
-    gridSize,
-    duration,
-    state: roomState,
-    playerCount: roomPlayers.size,
-    updatedAt: Date.now(),
-  }, { retain: true });
+
+  publish(
+    `${TOPIC_ROOT}/rooms/${roomId}/meta`,
+    {
+      hostId,
+      hostName: roomPlayers.get(hostId)?.name || playerName,
+      finishDistance,
+      playerCount: roomPlayers.size,
+      state: roomState,
+      updatedAt: Date.now(),
+    },
+    { retain: true },
+  );
 }
 
 function startRoomHeartbeat() {
@@ -387,307 +442,312 @@ function onStateUpdate(data) {
   if (!data) return;
 
   roomState = data.state || roomState;
-  gridSize = Number(data.gridSize || gridSize);
-  duration = Number(data.duration || duration);
-  remaining = Number(data.remaining ?? remaining);
   hostId = data.hostId || hostId;
+  finishDistance = Number(data.finishDistance || finishDistance);
   isHost = hostId === playerId;
 
-  $('lobbyGridSize').textContent = `${gridSize} x ${gridSize}`;
-  $('lobbyDuration').textContent = duration;
-  $('startGameBtn').hidden = !isHost;
-  $('lobbyWaitingMsg').hidden = isHost;
-
   if (roomState === 'waiting') {
-    activeMoles.clear();
-    showScreen('lobby');
-  } else if (roomState === 'playing') {
-    startGameScreen(remaining);
+    enterLobby();
+    return;
+  }
+
+  if (roomState === 'playing') {
+    startGameScreen();
   }
 }
 
 function onPlayersUpdate(players) {
+  clearTimeout(joinTimeoutTimer);
+
   roomPlayers.clear();
-  latestScores.clear();
 
-  players.forEach((p) => {
-    roomPlayers.set(p.id, { id: p.id, name: p.name, score: Number(p.score || 0) });
-    latestScores.set(p.id, { name: p.name, score: Number(p.score || 0) });
+  players.forEach((player) => {
+    const normalized = {
+      id: player.id,
+      name: player.name,
+      position: Number(player.position || 0),
+    };
+
+    roomPlayers.set(normalized.id, normalized);
+
+    if (!positions.has(normalized.id)) {
+      positions.set(normalized.id, normalized.position);
+    }
   });
 
-  const list = $('lobbyPlayers');
-  list.innerHTML = '';
-  players.forEach((p) => {
-    const li = document.createElement('li');
-    li.textContent = p.id === hostId ? `👑 ${p.name}` : p.name;
-    list.appendChild(li);
-  });
+  renderLobbyPlayers();
+
+  if (roomState === 'playing') {
+    renderRaceTrack();
+  }
 }
 
 function hostStartGame() {
   if (!isHost || roomState !== 'waiting') return;
 
   roomState = 'playing';
-  remaining = duration;
-  activeMoles.clear();
-  pendingHits.clear();
+  positions.clear();
 
   for (const player of roomPlayers.values()) {
-    player.score = 0;
+    player.position = 0;
+    positions.set(player.id, 0);
   }
 
-  publishState();
   publishPlayers();
-  publishScores();
-  publishRoomMeta();
-  hostScheduleSpawn();
-
-  clearInterval(countdownTimer);
-  countdownTimer = setInterval(() => {
-    if (roomState !== 'playing') return;
-    remaining -= 1;
-    publish(`${TOPIC_ROOT}/game/${roomId}/countdown`, { remaining });
-    if (remaining <= 0) hostEndGame();
-  }, 1000);
-}
-
-function hostScheduleSpawn() {
-  if (!isHost || roomState !== 'playing') return;
-
-  clearTimeout(spawnTimer);
-  spawnTimer = setTimeout(() => {
-    hostSpawnMole();
-    hostScheduleSpawn();
-  }, randomBetween(MIN_SPAWN_DELAY_MS, MAX_SPAWN_DELAY_MS));
-}
-
-function hostSpawnMole() {
-  const totalHoles = gridSize * gridSize;
-  const emptyHoles = [];
-  for (let i = 0; i < totalHoles; i += 1) {
-    if (!activeMoles.has(i)) emptyHoles.push(i);
-  }
-  if (emptyHoles.length === 0) return;
-
-  const holeIndex = emptyHoles[Math.floor(Math.random() * emptyHoles.length)];
-  const moleId = createId();
-  const showTime = randomBetween(MIN_SHOW_TIME_MS, MAX_SHOW_TIME_MS);
-
-  activeMoles.set(holeIndex, moleId);
-  publish(`${TOPIC_ROOT}/game/${roomId}/mole/spawn`, { holeIndex, moleId, showTime });
-
-  setTimeout(() => {
-    if (!isHost || roomState !== 'playing') return;
-    if (activeMoles.get(holeIndex) !== moleId) return;
-
-    activeMoles.delete(holeIndex);
-    publish(`${TOPIC_ROOT}/game/${roomId}/mole/despawn`, {
-      holeIndex,
-      moleId,
-      reason: 'timeout',
-    });
-  }, showTime);
-}
-
-function hostHandleHit({ playerId: hitPlayerId, holeIndex, moleId } = {}) {
-  if (!isHost || roomState !== 'playing') return;
-  if (!Number.isInteger(holeIndex) || !moleId || !hitPlayerId) return;
-  if (activeMoles.get(holeIndex) !== moleId) return;
-
-  const player = roomPlayers.get(hitPlayerId);
-  if (!player) return;
-
-  activeMoles.delete(holeIndex);
-  player.score += 1;
-
-  publish(`${TOPIC_ROOT}/game/${roomId}/mole/despawn`, {
-    holeIndex,
-    moleId,
-    reason: 'hit',
-    playerId: hitPlayerId,
-  });
-  publishScores();
-}
-
-function hostEndGame() {
-  if (!isHost || roomState === 'ended') return;
-
-  roomState = 'ended';
-  remaining = 0;
-  clearInterval(countdownTimer);
-  clearTimeout(spawnTimer);
-  activeMoles.clear();
-
-  const leaderboard = [...roomPlayers.values()]
-    .map((p) => ({ playerId: p.id, name: p.name, score: p.score }))
-    .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
-
   publishState();
-  publish(`${TOPIC_ROOT}/game/${roomId}/result`, { leaderboard }, { retain: true });
   publishRoomMeta();
+  startGameScreen();
 }
 
-function startGameScreen(seconds) {
+function startGameScreen() {
   showScreen('game');
-  $('timeRemaining').textContent = seconds;
-  $('myScore').textContent = latestScores.get(playerId)?.score ?? 0;
+  $('gameRoomId').textContent = roomId || '-----';
+  $('gameFinishDistance').textContent = finishDistance;
+  $('myFinishDistance').textContent = finishDistance;
 
-  if ($('grid').children.length !== gridSize * gridSize) {
-    buildGrid(gridSize);
+  if (!positions.has(playerId)) {
+    positions.set(playerId, roomPlayers.get(playerId)?.position || 0);
   }
+
+  updateMyProgress();
+  renderRaceTrack();
+  $('runBtn').disabled = roomState !== 'playing';
 }
 
-function buildGrid(size) {
-  const grid = $('grid');
-  grid.innerHTML = '';
-  grid.style.gridTemplateColumns = `repeat(${size}, 1fr)`;
-  activeMoles.clear();
-
-  for (let i = 0; i < size * size; i += 1) {
-    const hole = document.createElement('div');
-    hole.className = 'hole';
-    hole.dataset.index = String(i);
-
-    const mole = document.createElement('span');
-    mole.className = 'mole';
-    mole.textContent = '🐹';
-
-    hole.appendChild(mole);
-    hole.addEventListener('click', () => onHoleClick(i));
-    grid.appendChild(hole);
-  }
-}
-
-function getHoleEl(index) {
-  return document.querySelector(`.hole[data-index="${index}"]`);
-}
-
-function onMoleSpawn({ holeIndex, moleId }) {
-  activeMoles.set(holeIndex, moleId);
-  const hole = getHoleEl(holeIndex);
-  if (hole) {
-    hole.classList.remove('hit');
-    hole.classList.add('active');
-  }
-}
-
-function onMoleDespawn({ holeIndex, moleId }) {
-  pendingHits.delete(moleId);
-
-  if (activeMoles.get(holeIndex) !== moleId) return;
-
-  activeMoles.delete(holeIndex);
-
-  const hole = getHoleEl(holeIndex);
-
-  if (hole) {
-    hole.classList.remove('active');
-    hole.classList.add('hit');
-  }
-}
-
-function onHoleClick(holeIndex) {
+function runOneStep() {
   if (roomState !== 'playing') return;
+  if (!roomPlayers.has(playerId)) return;
 
-  const moleId = activeMoles.get(holeIndex);
-  if (!moleId) return;
+  const currentPosition = positions.get(playerId) || 0;
+  if (currentPosition >= finishDistance) return;
 
-  // 同一隻地鼠已經點過就不再處理
-  if (pendingHits.has(moleId)) return;
+  // Important: local UI moves immediately. No MQTT round trip is required.
+  const nextPosition = Math.min(finishDistance, currentPosition + 1);
+  positions.set(playerId, nextPosition);
 
-  pendingHits.add(moleId);
+  const localPlayer = roomPlayers.get(playerId);
+  if (localPlayer) localPlayer.position = nextPosition;
 
-  const hole = getHoleEl(holeIndex);
+  updateRunner(playerId);
+  updateMyProgress();
 
-  if (hole) {
-    hole.classList.remove('active');
-    hole.classList.add('hit');
-  }
-
-  // Optimistic UI：自己的分數立即增加
-  const currentScore = latestScores.get(playerId)?.score ?? 0;
-
-  latestScores.set(playerId, {
-    name: playerName,
-    score: currentScore + 1,
+  // Broadcast an absolute position instead of a delta.
+  // If a QoS 0 packet is lost, the next click still carries the newest position.
+  publish(`${TOPIC_ROOT}/game/${roomId}/race/progress`, {
+    playerId,
+    playerName,
+    position: nextPosition,
+    ts: Date.now(),
   });
 
-  $('myScore').textContent = currentScore + 1;
-
-  // 房主自己直接處理，不繞 MQTT
+  // The host can finish its own race without waiting for its message to return.
   if (isHost) {
-    hostHandleHit({
+    hostAcceptProgress({
       playerId,
       playerName,
-      holeIndex,
-      moleId,
-      ts: Date.now(),
+      position: nextPosition,
     });
+  }
+}
 
+function onRaceProgress(data) {
+  const racingPlayerId = data?.playerId;
+  const incomingPosition = Number(data?.position);
+
+  if (!racingPlayerId || !Number.isFinite(incomingPosition)) return;
+
+  if (isHost) {
+    hostAcceptProgress(data);
     return;
   }
 
-  publish(`${TOPIC_ROOT}/game/${roomId}/mole/hit`, {
-    playerId,
-    playerName,
-    holeIndex,
-    moleId,
-    ts: Date.now(),
-  });
+  applyProgress(racingPlayerId, incomingPosition);
 }
 
-function onScoreUpdate(scores) {
-  latestScores.clear();
+function hostAcceptProgress({ playerId: racingPlayerId, position } = {}) {
+  if (!isHost || roomState !== 'playing') return;
+  if (!racingPlayerId || !roomPlayers.has(racingPlayerId)) return;
 
-  scores.forEach((s) => {
-    latestScores.set(s.playerId, {
-      name: s.name,
-      score: Number(s.score || 0),
-    });
-  });
+  const incomingPosition = Math.max(0, Math.min(finishDistance, Number(position) || 0));
+  const player = roomPlayers.get(racingPlayerId);
+  const acceptedPosition = Math.max(Number(player.position || 0), incomingPosition);
 
-  $('myScore').textContent =
-    latestScores.get(playerId)?.score ?? 0;
+  player.position = acceptedPosition;
+  positions.set(racingPlayerId, acceptedPosition);
+  updateRunner(racingPlayerId);
 
-  renderScoreboard($('scoreboard'), scores);
-}
-
-function renderScoreboard(el, scores) {
-  el.innerHTML = '';
-  scores.forEach((s) => {
-    const li = document.createElement('li');
-    li.textContent = `${s.name}：${s.score} 分`;
-    if (s.playerId === playerId) li.classList.add('me');
-    el.appendChild(li);
-  });
-}
-
-function onResult(leaderboard) {
-  roomState = 'ended';
-  showScreen('result');
-  renderScoreboard($('finalLeaderboard'), leaderboard);
-}
-
-function leaveRoomAndReload() {
-  if (isHost && roomId) {
-    publish(`${TOPIC_ROOT}/rooms/${roomId}/meta`, {
-      hostId,
-      hostName: playerName,
-      gridSize,
-      duration,
-      state: 'ended',
-      playerCount: roomPlayers.size,
-      updatedAt: Date.now(),
-    }, { retain: true });
+  if (acceptedPosition >= finishDistance) {
+    hostFinishRace(racingPlayerId);
   }
+}
+
+function applyProgress(racingPlayerId, incomingPosition) {
+  const safePosition = Math.max(0, Math.min(finishDistance, incomingPosition));
+  const previousPosition = positions.get(racingPlayerId) || 0;
+
+  // Ignore older/out-of-order MQTT packets.
+  if (safePosition < previousPosition) return;
+
+  positions.set(racingPlayerId, safePosition);
+
+  const player = roomPlayers.get(racingPlayerId);
+  if (player) player.position = safePosition;
+
+  updateRunner(racingPlayerId);
+
+  if (racingPlayerId === playerId) {
+    updateMyProgress();
+  }
+}
+
+function hostFinishRace(winnerId) {
+  if (!isHost || roomState !== 'playing') return;
+
+  roomState = 'ended';
+
+  const leaderboard = [...roomPlayers.values()]
+    .map((player) => ({
+      playerId: player.id,
+      name: player.name,
+      position: Number(player.position || 0),
+    }))
+    .sort((a, b) => {
+      if (a.playerId === winnerId) return -1;
+      if (b.playerId === winnerId) return 1;
+      return b.position - a.position || a.name.localeCompare(b.name);
+    });
+
+  publishState();
+  publishRoomMeta();
+
+  publish(
+    `${TOPIC_ROOT}/game/${roomId}/race/result`,
+    {
+      winnerId,
+      leaderboard,
+      finishedAt: Date.now(),
+    },
+    { retain: true },
+  );
+
+  onRaceResult({ winnerId, leaderboard });
+}
+
+function onRaceResult({ winnerId, leaderboard } = {}) {
+  if (!Array.isArray(leaderboard)) return;
+
+  roomState = 'ended';
+  $('runBtn').disabled = true;
+
+  const winner = leaderboard.find((item) => item.playerId === winnerId);
+  $('resultTitle').textContent = winner ? `${winner.name} 獲勝！` : '比賽結束！';
+
+  const list = $('finalLeaderboard');
+  list.innerHTML = '';
+
+  leaderboard.forEach((item, index) => {
+    const li = document.createElement('li');
+    const prefix = index === 0 ? '🏆 ' : '';
+    li.textContent = `${prefix}${item.name}：${item.position}/${finishDistance}`;
+    if (item.playerId === playerId) li.classList.add('me');
+    list.appendChild(li);
+  });
+
+  showScreen('result');
+}
+
+function renderRaceTrack() {
+  const track = $('raceTrack');
+  track.innerHTML = '';
+
+  const players = [...roomPlayers.values()];
+
+  players.forEach((player, index) => {
+    const row = document.createElement('div');
+    row.className = 'racer-row';
+    row.dataset.playerId = player.id;
+
+    const head = document.createElement('div');
+    head.className = 'racer-head';
+
+    const name = document.createElement('span');
+    name.className = 'racer-name';
+    if (player.id === playerId) name.classList.add('me');
+    name.textContent = player.name;
+
+    const progress = document.createElement('span');
+    progress.className = 'racer-progress';
+    progress.textContent = `${positions.get(player.id) || 0}/${finishDistance}`;
+
+    head.append(name, progress);
+
+    const line = document.createElement('div');
+    line.className = 'track-line';
+
+    const runner = document.createElement('div');
+    runner.className = 'runner';
+    runner.dataset.playerId = player.id;
+    runner.textContent = RUNNER_EMOJIS[index % RUNNER_EMOJIS.length];
+
+    const finish = document.createElement('div');
+    finish.className = 'finish-line';
+
+    line.append(runner, finish);
+    row.append(head, line);
+    track.appendChild(row);
+
+    updateRunner(player.id);
+  });
+}
+
+function updateRunner(racingPlayerId) {
+  const row = document.querySelector(`.racer-row[data-player-id="${CSS.escape(racingPlayerId)}"]`);
+  if (!row) return;
+
+  const runner = row.querySelector('.runner');
+  const progress = row.querySelector('.racer-progress');
+  const position = positions.get(racingPlayerId) || 0;
+  const percent = finishDistance > 0 ? position / finishDistance : 0;
+
+  // Keep some space before the finish-line graphic.
+  const visualPercent = Math.min(1, percent) * 88;
+  runner.style.left = `${visualPercent}%`;
+  progress.textContent = `${position}/${finishDistance}`;
+}
+
+function updateMyProgress() {
+  $('myPosition').textContent = positions.get(playerId) || 0;
+  $('myFinishDistance').textContent = finishDistance;
+}
+
+function leaveToHome() {
+  if (isHost && roomId) {
+    clearRetained(`${TOPIC_ROOT}/rooms/${roomId}/meta`);
+    clearRetained(`${TOPIC_ROOT}/game/${roomId}/state`);
+    clearRetained(`${TOPIC_ROOT}/game/${roomId}/players`);
+    clearRetained(`${TOPIC_ROOT}/game/${roomId}/race/result`);
+  }
+
   location.reload();
 }
+
+// Avoid leaving a stale public room in the retained room list when possible.
+window.addEventListener('beforeunload', () => {
+  if (isHost && roomId && mqttClient?.connected) {
+    clearRetained(`${TOPIC_ROOT}/rooms/${roomId}/meta`);
+  }
+});
 
 $('createRoomBtn').addEventListener('click', doCreateRoom);
 $('joinRoomBtn').addEventListener('click', () => doJoinRoom());
 $('refreshRoomsBtn').addEventListener('click', renderRoomList);
 $('startGameBtn').addEventListener('click', hostStartGame);
-$('backToLobbyBtn').addEventListener('click', leaveRoomAndReload);
+$('runBtn').addEventListener('click', runOneStep);
+$('backToHomeBtn').addEventListener('click', leaveToHome);
+
+$('roomCodeInput').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') doJoinRoom();
+});
 
 connectMqtt();
 roomListTimer = setInterval(() => {

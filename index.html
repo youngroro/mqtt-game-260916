@@ -1,98 +1,100 @@
 <!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>MQTT 打地鼠遊戲</title>
-<link rel="stylesheet" href="style.css" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MQTT 多人賽跑</title>
+  <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-<div id="app">
-
-  <header class="app-header">
-    <h1>🐹 MQTT 打地鼠大戰</h1>
-    <div id="connStatus" class="conn-status offline">MQTT: 連線中...</div>
-  </header>
-
-  <!-- ===== Login / Lobby list screen ===== -->
-  <section id="screen-login" class="screen">
-    <div class="card">
-      <h2>1. 輸入暱稱</h2>
-      <input id="nicknameInput" type="text" placeholder="你的暱稱" maxlength="16" />
-    </div>
-
-    <div class="card">
-      <h2>2. 建立新房間</h2>
-      <div class="form-row">
-        <label>遊戲時長
-          <select id="durationSelect">
-            <option value="30">30 秒</option>
-            <option value="60" selected>60 秒</option>
-            <option value="90">90 秒</option>
-          </select>
-        </label>
-        <label>格子大小
-          <select id="gridSizeSelect">
-            <option value="3" selected>3 x 3</option>
-            <option value="4">4 x 4</option>
-          </select>
-        </label>
+  <main id="app">
+    <header class="app-header">
+      <div>
+        <h1>🏁 MQTT 多人賽跑</h1>
+        <p class="subtitle">GitHub Pages + MQTT WebSocket</p>
       </div>
-      <button id="createRoomBtn">建立房間</button>
-    </div>
+      <div id="connStatus" class="conn-status offline">MQTT：連線中...</div>
+    </header>
 
-    <div class="card">
-      <h2>3. 加入現有房間</h2>
-      <div class="form-row">
-        <input id="roomCodeInput" type="text" placeholder="房間代碼" maxlength="8" style="text-transform:uppercase" />
-        <button id="joinRoomBtn">加入</button>
+    <section id="screen-login" class="screen">
+      <div class="card">
+        <h2>你的暱稱</h2>
+        <input id="nicknameInput" type="text" maxlength="16" placeholder="例如：Olive" autocomplete="off" />
       </div>
-      <div class="room-list-header">
-        <h3>目前的房間</h3>
-        <button id="refreshRoomsBtn" class="secondary">重新整理</button>
+
+      <div class="card">
+        <h2>建立房間</h2>
+        <label class="field-label" for="finishDistanceSelect">終點距離</label>
+        <select id="finishDistanceSelect">
+          <option value="20">20 格（快）</option>
+          <option value="30" selected>30 格（標準）</option>
+          <option value="50">50 格（長）</option>
+        </select>
+        <button id="createRoomBtn" class="primary full">建立房間</button>
       </div>
-      <ul id="roomList" class="room-list"></ul>
-    </div>
 
-    <p id="loginError" class="error-text"></p>
-  </section>
+      <div class="card">
+        <h2>加入房間</h2>
+        <div class="join-row">
+          <input id="roomCodeInput" type="text" maxlength="5" placeholder="房間代碼" autocomplete="off" />
+          <button id="joinRoomBtn" class="primary">加入</button>
+        </div>
 
-  <!-- ===== Lobby (waiting room) screen ===== -->
-  <section id="screen-lobby" class="screen" hidden>
-    <div class="card">
-      <h2>房間代碼：<span id="lobbyRoomId"></span></h2>
-      <p>把這個代碼分享給朋友，讓他們在「加入現有房間」輸入即可一起玩。</p>
-      <p>格子大小：<span id="lobbyGridSize"></span> ｜ 時長：<span id="lobbyDuration"></span> 秒</p>
-      <h3>玩家列表</h3>
-      <ul id="lobbyPlayers" class="player-list"></ul>
-      <button id="startGameBtn" hidden>開始遊戲（房主）</button>
-      <p id="lobbyWaitingMsg">等待房主開始遊戲...</p>
-    </div>
-  </section>
+        <div class="room-list-header">
+          <h3>目前可加入房間</h3>
+          <button id="refreshRoomsBtn" class="secondary small">重新整理</button>
+        </div>
+        <ul id="roomList" class="room-list"></ul>
+      </div>
 
-  <!-- ===== Game screen ===== -->
-  <section id="screen-game" class="screen" hidden>
-    <div class="game-topbar">
-      <div class="timer">⏱️ <span id="timeRemaining">--</span>s</div>
-      <div class="my-score">你的分數：<span id="myScore">0</span></div>
-    </div>
-    <div id="grid" class="grid"></div>
-    <h3>即時排行榜</h3>
-    <ol id="scoreboard" class="scoreboard"></ol>
-  </section>
+      <p id="loginError" class="error-text"></p>
+    </section>
 
-  <!-- ===== Result screen ===== -->
-  <section id="screen-result" class="screen" hidden>
-    <div class="card">
-      <h2>🏆 遊戲結束！</h2>
-      <ol id="finalLeaderboard" class="scoreboard"></ol>
-      <button id="backToLobbyBtn">回到大廳</button>
-    </div>
-  </section>
+    <section id="screen-lobby" class="screen" hidden>
+      <div class="card">
+        <div class="room-code-box">
+          <span>房間代碼</span>
+          <strong id="lobbyRoomId">-----</strong>
+        </div>
 
-</div>
+        <p>終點距離：<strong><span id="lobbyFinishDistance">30</span> 格</strong></p>
 
-<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
-<script src="game.js"></script>
+        <h3>玩家</h3>
+        <ul id="lobbyPlayers" class="player-list"></ul>
+
+        <button id="startGameBtn" class="primary full" hidden>開始比賽</button>
+        <p id="lobbyWaitingMsg" class="hint">等待房主開始比賽...</p>
+      </div>
+    </section>
+
+    <section id="screen-game" class="screen" hidden>
+      <div class="game-status card compact">
+        <div>房間：<strong id="gameRoomId">-----</strong></div>
+        <div>終點：<strong><span id="gameFinishDistance">30</span> 格</strong></div>
+      </div>
+
+      <div id="raceTrack" class="race-track"></div>
+
+      <div class="control-card card">
+        <div class="my-progress">
+          我的進度：<strong><span id="myPosition">0</span>/<span id="myFinishDistance">30</span></strong>
+        </div>
+        <button id="runBtn" class="run-button">🏃 跑！</button>
+        <p class="hint">每按一次前進 1 格；自己的畫面會立即更新，再透過 MQTT 同步給其他玩家。</p>
+      </div>
+    </section>
+
+    <section id="screen-result" class="screen" hidden>
+      <div class="card result-card">
+        <div class="trophy">🏆</div>
+        <h2 id="resultTitle">比賽結束！</h2>
+        <ol id="finalLeaderboard" class="leaderboard"></ol>
+        <button id="backToHomeBtn" class="primary full">回首頁</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+  <script src="game.js"></script>
 </body>
 </html>
